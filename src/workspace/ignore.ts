@@ -66,6 +66,7 @@ export const NOISE_PATTERNS: string[] = [
   ".tooling/",
   ".pnpm-store/",
   ".DS_Store",
+  "._*",
   "*.lock",
   "pnpm-lock.yaml",
   "package-lock.json",

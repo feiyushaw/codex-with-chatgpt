@@ -73,8 +73,11 @@ Delete + recreate that workspace's ChatGPT connector. A workspace may instead
 choose a named hostname once (`c2c tunnel choose --mode named`). The Skill asks
 before the first public URL exists; `cloudflared tunnel login` is the only extra
 user step. Tunnel name, hostname and preference live under the OS state dir
-(`tunnels/<workspaceId>.json`), never in the project. Named starts use
-`cloudflared tunnel --url … run <name>` so the public URL stays stable. If named
-provisioning fails, C2C falls back to Quick Tunnel. If a named tunnel later
-drops, doctor asks for a Cloudflare re-login (`namedRepair`) instead of
-rotating the ChatGPT connector.
+(`tunnels/<workspaceId>.json`), never in the project. Named starts generate an
+isolated temporary ingress configuration (`--config <path>`) and run
+`cloudflared tunnel --no-autoupdate --config <path> run <name>` so the public
+URL stays stable and does not conflict with existing `~/.cloudflared/config.yml`
+ingress rules on the user's machine. Quick tunnels also pass `--config /dev/null`
+to ensure full configuration isolation. If named provisioning fails, C2C falls
+back to Quick Tunnel. If a named tunnel later drops, doctor asks for a Cloudflare
+re-login (`namedRepair`) instead of rotating the ChatGPT connector.

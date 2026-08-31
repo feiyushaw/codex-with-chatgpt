@@ -1,5 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import readline from "node:readline";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import { findBinary } from "./detect.js";
@@ -11,11 +14,11 @@ const HOSTNAME_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a
 export interface CloudflaredNamedTunnelOptions {
   tunnelName: string;
   hostname: string;
+  tunnelId?: string;
   logger?: Logger;
   binaryOverride?: string;
   startTimeoutMs?: number;
 }
-
 export function normalizeNamedTunnelHostname(hostname: string): string {
   const normalized = hostname.trim().toLowerCase().replace(/\.$/, "");
   if (!HOSTNAME_RE.test(normalized)) {
@@ -34,6 +37,7 @@ export function normalizeNamedTunnelHostname(hostname: string): string {
 export class CloudflaredNamedTunnel implements TunnelProvider {
   readonly name = "cloudflare-named";
   private readonly tunnelName: string;
+  private readonly tunnelId?: string;
   private readonly hostname: string;
   private readonly logger: Logger;
   private readonly binaryOverride?: string;
@@ -41,6 +45,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
   private child: ChildProcess | null = null;
   private connected = false;
   private lastError: string | null = null;
+  private configFile: string | null = null;
 
   constructor(opts: CloudflaredNamedTunnelOptions) {
     const tunnelName = opts.tunnelName.trim();
@@ -48,18 +53,39 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       throw new Error("Named tunnel name must be between 1 and 128 characters");
     }
     this.tunnelName = tunnelName;
+    this.tunnelId = opts.tunnelId?.trim() || undefined;
     this.hostname = normalizeNamedTunnelHostname(opts.hostname);
     this.logger = opts.logger ?? nullLogger;
     this.binaryOverride = opts.binaryOverride;
     this.startTimeoutMs = opts.startTimeoutMs ?? 45_000;
   }
-
   private binary(): string | null {
     return this.binaryOverride ?? findBinary("cloudflared");
   }
 
   private publicUrl(): string {
     return `https://${this.hostname}`;
+  }
+
+  private createConfigFile(localPort: number): string {
+    const configDir = path.join(os.tmpdir(), "c2c-tunnels");
+    fs.mkdirSync(configDir, { recursive: true });
+    const configFile = path.join(configDir, `config-${this.tunnelName}.yml`);
+    const credFile = this.tunnelId
+      ? path.join(os.homedir(), ".cloudflared", `${this.tunnelId}.json`)
+      : undefined;
+
+    let yaml = `tunnel: ${this.tunnelId ?? this.tunnelName}\n`;
+    if (credFile && fs.existsSync(credFile)) {
+      yaml += `credentials-file: ${credFile}\n`;
+    }
+    yaml += `ingress:\n`;
+    yaml += `  - hostname: ${this.hostname}\n`;
+    yaml += `    service: http://127.0.0.1:${localPort}\n`;
+    yaml += `  - service: http_status:404\n`;
+
+    fs.writeFileSync(configFile, yaml, { encoding: "utf8", mode: 0o600 });
+    return configFile;
   }
 
   async start(localPort: number): Promise<string> {
@@ -71,14 +97,17 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       );
     }
 
+    const configFile = this.createConfigFile(localPort);
+    this.configFile = configFile;
+
     return new Promise<string>((resolve, reject) => {
       const child = spawn(
         bin,
         [
           "tunnel",
           "--no-autoupdate",
-          "--url",
-          `http://127.0.0.1:${localPort}`,
+          "--config",
+          configFile,
           "run",
           this.tunnelName,
         ],
@@ -152,6 +181,14 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       this.child = null;
     }
     this.connected = false;
+    if (this.configFile) {
+      try {
+        fs.unlinkSync(this.configFile);
+      } catch {
+        // best effort
+      }
+      this.configFile = null;
+    }
   }
 
   async restart(localPort: number): Promise<string> {

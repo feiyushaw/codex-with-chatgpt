@@ -80,9 +80,21 @@ do not need elevation.
 Handled automatically: an existing healthy bridge for the same workspace is
 reused; anything else makes the bridge pick a free port. Configuration follows
 automatically.
+### "MCP server does not implement OAuth" / Cloudflare 404
+If you have existing Cloudflare tunnels on your machine (e.g. `~/.cloudflared/config.yml`),
+C2C automatically generates dedicated ingress configuration files to isolate the
+bridge traffic from your global rules. If ChatGPT reports this error, verify that
+DNS CNAME routing is complete (`c2c doctor -w <workspace>`) and wait ~30s for edge
+propagation.
+
+### Multiple projects / workspaces scope
+Each workspace directory gets its own secure, isolated MCP endpoint (e.g.
+`c2c-<workspace>.yourdomain.com`) to prevent cross-workspace data leakage.
+If you work across multiple tightly-coupled subdirectories and prefer a single
+one-time authorization in ChatGPT, initialize C2C on the common parent directory
+(e.g. `/path/to/project-root`).
 
 ### Reading a file returns ACCESS_DENIED_SENSITIVE_FILE
-Working as intended: `.env`, keys, credentials and anything matched by
 `.c2cignore` are never readable through ChatGPT. `.env.example` is allowed.
 
 ### I cannot see Projects in the ChatGPT sidebar
