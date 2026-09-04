@@ -15,6 +15,10 @@ can (restarts the bridge, restarts the tunnel) without asking.
 `c2c start` (or let doctor do it). Bridge logs:
 `c2c logs`, or verbose: `c2c logs --verbose`.
 
+If doctor says the bridge state is **uncertain** (无法确认), do not start a
+second bridge and do not Delete the ChatGPT connector. Wait and run doctor
+again. The local process may still be running.
+
 ### Everything was quit and ChatGPT can no longer connect
 Quitting Codex / the terminal stops the public address. The next `c2c doctor`
 starts a new address and sets `chatgptRepair.needed`. The Skill should tell the
@@ -64,6 +68,8 @@ macOS: `brew install cloudflared`
 Windows: `winget install Cloudflare.cloudflared`
 Linux: see Cloudflare's package instructions.
 The Skill installs this automatically during setup.
+If cloudflared is installed in a custom location that is not on `PATH`, set
+`C2C_CLOUDFLARED_PATH` to the executable's absolute path before running `c2c`.
 
 ### Every new Codex chat “repairs” the connection / cannot write logs
 The C2C state directory lives outside the project (macOS:

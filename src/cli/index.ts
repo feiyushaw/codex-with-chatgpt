@@ -4,11 +4,10 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
-import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
-import { appendExecutionRecord } from "../execution/records.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
 import {
   chooseQuickTunnel,
@@ -28,6 +27,7 @@ import {
 import { Logger } from "../logger/index.js";
 import { getStateDir } from "../config/paths.js";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
+import { mergeUiPrefs, readUiPrefs, SETUP_MODES, type SetupMode } from "../config/ui-prefs.js";
 import {
   CHATGPT_CREATE_CONNECTOR_URL,
   CHATGPT_DEVELOPER_MODE_URL,
@@ -48,8 +48,14 @@ import {
   readSession,
   resolveConversation,
   writeSession,
+  PROTOCOL_STATES,
+  WAITING_FOR,
   type ConversationMode,
+  type ProtocolState,
+  type WaitingFor,
 } from "../session/state.js";
+import { appendExecutionRecord } from "../execution/records.js";
+import { saveExecutionOutput } from "../execution/output.js";
 
 const program = new Command();
 
@@ -61,6 +67,20 @@ const cross = (msg: string): void => say(`✗ ${msg}`);
 
 function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
+}
+
+/** Local harness output only. Never pasted into ChatGPT. */
+const MAX_RECORD_OUTPUT_READ = 256 * 1024;
+
+function readCappedUtf8(filePath: string, maxBytes: number): string {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    return buf.subarray(0, n).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function persistWorkspaceEndpoint(opts: {
@@ -334,12 +354,21 @@ program
   .action(async (opts: { workspace?: string; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
-    const runtime = await findLiveBridge(workspace.id);
-    if (!runtime) {
+    const observation = await findBridgeObservation(workspace.id);
+    if (observation.state === "unknown") {
+      if (opts.json) {
+        say(JSON.stringify({ ok: false, running: null, state: "unknown", reason: observation.reason }));
+      } else {
+        cross(`Bridge 状态无法确认（${observation.reason}），未将其视为未运行。`);
+      }
+      return;
+    }
+    if (observation.state === "stopped") {
       if (opts.json) say(JSON.stringify({ ok: false, running: false }));
       else say("Bridge 未运行。使用 `c2c start` 启动。");
       return;
     }
+    const runtime = observation.runtime;
     const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     if (opts.json) {
       say(JSON.stringify({ ok: true, running: true, ...info }));
@@ -402,9 +431,15 @@ program
 
     // Bridge
     let runtime: RuntimeState | null = null;
+    let bridgeUnknown = false;
     if (workspace) {
-      runtime = await findLiveBridge(workspace.id);
-      if (!runtime && opts.fix) {
+      const observation = await findBridgeObservation(workspace.id);
+      if (observation.state === "healthy") {
+        runtime = observation.runtime;
+      } else if (observation.state === "unknown") {
+        bridgeUnknown = true;
+        report.bridge = { ok: false, detail: `状态无法确认（${observation.reason}），未自动修复` };
+      } else if (opts.fix) {
         try {
           runtime = (await ensureBridge(root)).runtime;
           results.push("已自动启动 Bridge");
@@ -574,6 +609,8 @@ program
       } else {
         report.tunnel = { ok: false, detail: "公网地址无法访问" };
       }
+    } else if (bridgeUnknown) {
+      report.tunnel = report.tunnel ?? { ok: false, detail: "Bridge 状态无法确认，未执行连接器修复" };
     } else if (namedReady) {
       report.tunnel = { ok: false, detail: "NAMED_TUNNEL_DOWN" };
       namedRepair = { needed: true, userMessage: NAMED_REPAIR_MESSAGE };
@@ -825,6 +862,11 @@ session
       if (saved.url) say(`对话：${saved.url}`);
       if (saved.connectorName) say(`连接器：${saved.connectorName}`);
       if (saved.taskId) say(`任务：${saved.taskId}（第 ${saved.iteration ?? 0} 轮，${saved.lastState ?? "?"}）`);
+      if (saved.checkpoint) {
+        say(
+          `存档：${saved.checkpoint.protocolState} / 等待 ${saved.checkpoint.waitingFor}（第 ${saved.checkpoint.iteration} 轮）`
+        );
+      }
     }
   });
 
@@ -840,6 +882,13 @@ session
   .option("--mode <mode>", "long-chat or project")
   .option("--project-url <url>", "ChatGPT Project collection URL (…/g/g-p-…/project)")
   .option("--connector-name <name>", "exact connector title for this workspace")
+  .option("--protocol-state <state>", "checkpoint protocol state, e.g. EXECUTED_SENT")
+  .option("--waiting-for <who>", "none | GPT_PLAN | GPT_REVIEW | USER")
+  .option("--goal <text>", "original task goal for resume / HANDOFF")
+  .option("--completed-subtasks <text>")
+  .option("--known-issues <text>")
+  .option("--next-step <text>")
+  .option("--clear-checkpoint", "drop the active checkpoint (task DONE)", false)
   .action(
     (opts: {
       workspace?: string;
@@ -851,11 +900,31 @@ session
       mode?: string;
       projectUrl?: string;
       connectorName?: string;
+      protocolState?: string;
+      waitingFor?: string;
+      goal?: string;
+      completedSubtasks?: string;
+      knownIssues?: string;
+      nextStep?: string;
+      clearCheckpoint: boolean;
     }) => {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       const modeRaw = opts.mode?.trim().toLowerCase();
       if (modeRaw && modeRaw !== "long-chat" && modeRaw !== "project") {
         throw new Error("mode must be long-chat or project");
+      }
+      const protocolRaw = opts.protocolState?.trim().toUpperCase();
+      if (protocolRaw && !PROTOCOL_STATES.includes(protocolRaw as ProtocolState)) {
+        throw new Error(`protocol-state must be one of ${PROTOCOL_STATES.join(", ")}`);
+      }
+      const waitingRaw = opts.waitingFor?.trim();
+      const waitingNorm = waitingRaw
+        ? waitingRaw.toLowerCase() === "none"
+          ? "none"
+          : waitingRaw.toUpperCase()
+        : undefined;
+      if (waitingNorm && !WAITING_FOR.includes(waitingNorm as WaitingFor)) {
+        throw new Error(`waiting-for must be one of ${WAITING_FOR.join(", ")}`);
       }
       const saved = mergeSession(readSession(workspace.id), {
         url: opts.url,
@@ -866,6 +935,17 @@ session
         conversationMode: modeRaw as ConversationMode | undefined,
         projectUrl: opts.projectUrl,
         connectorName: opts.connectorName,
+        clearCheckpoint: opts.clearCheckpoint,
+        checkpoint: protocolRaw
+          ? {
+              protocolState: protocolRaw as ProtocolState,
+              waitingFor: (waitingNorm as WaitingFor | undefined) ?? undefined,
+              originalGoal: opts.goal,
+              completedSubtasks: opts.completedSubtasks,
+              knownIssues: opts.knownIssues,
+              nextExpectedStep: opts.nextStep,
+            }
+          : undefined,
       });
       writeSession(workspace.id, saved);
       if (saved.projectUrl && saved.conversationMode === "project") {
@@ -888,6 +968,57 @@ session
     else check("已清除会话记录，下次任务将新建 ChatGPT 会话");
   });
 
+const prefsCmd = program
+  .command("prefs")
+  .description("Remember ChatGPT developer mode and setup choice for this machine");
+
+prefsCmd
+  .command("get", { isDefault: true })
+  .description("Show remembered ChatGPT setup choices (not per workspace)")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    const prefs = readUiPrefs();
+    if (opts.json) {
+      say(JSON.stringify({ ok: true, ...prefs }));
+      return;
+    }
+    say(prefs.developerModeEnabled ? "开发人员模式：已记住已开启" : "开发人员模式：尚未记住");
+    if (prefs.setupMode === "auto") say("配置方式：AI 自动化配置（预览版）");
+    else if (prefs.setupMode === "manual") say("配置方式：手动教学配置");
+    else say("配置方式：尚未选择");
+  });
+
+prefsCmd
+  .command("set")
+  .description("Save a ChatGPT setup choice for this machine")
+  .option("--developer-mode", "remember that ChatGPT developer mode is on", false)
+  .option("--setup-mode <mode>", "auto (preview) or manual")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { developerMode: boolean; setupMode?: string; json: boolean }) => {
+    try {
+      const modeRaw = opts.setupMode?.trim().toLowerCase();
+      if (modeRaw && !SETUP_MODES.includes(modeRaw as SetupMode)) {
+        throw new Error(`setup-mode must be one of ${SETUP_MODES.join(", ")}`);
+      }
+      if (!opts.developerMode && !modeRaw) {
+        throw new Error("nothing to save: pass --developer-mode and/or --setup-mode");
+      }
+      const prefs = mergeUiPrefs({
+        developerModeEnabled: opts.developerMode ? true : undefined,
+        setupMode: modeRaw as SetupMode | undefined,
+      });
+      if (opts.json) {
+        say(JSON.stringify({ ok: true, ...prefs }));
+        return;
+      }
+      if (opts.developerMode) check("已记住开发人员模式已开启");
+      if (modeRaw === "auto") check("已记住配置方式：AI 自动化配置（预览版）");
+      if (modeRaw === "manual") check("已记住配置方式：手动教学配置");
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
 program
   .command("record", { hidden: true })
   .description("Record a Codex execution summary (used by the Skill)")
@@ -898,6 +1029,10 @@ program
   .option("--tests <summary>", "e.g. '27 passed'")
   .option("--exit-status <status>", "ok | failed | blocked", "ok")
   .option("--notes <text>")
+  .option("--command <text>", "command whose output may be offered to ChatGPT")
+  .option("--output <text>", "command output (prefer --output-file for long logs)")
+  .option("--output-file <path>", "read command output from a local file")
+  .option("--exit-code <n>", "numeric exit code of that command")
   .action(
     (opts: {
       workspace?: string;
@@ -907,11 +1042,32 @@ program
       tests?: string;
       exitStatus: string;
       notes?: string;
+      command?: string;
+      output?: string;
+      outputFile?: string;
+      exitCode?: string;
     }) => {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       const changed = /^\d+$/.test(opts.changedFiles)
         ? parseInt(opts.changedFiles, 10)
         : opts.changedFiles.split(",").map((file) => file.trim()).filter(Boolean);
+      let outputId: number | undefined;
+      let outputAvailable = false;
+      const rawOutput =
+        opts.outputFile !== undefined
+          ? readCappedUtf8(path.resolve(opts.outputFile), MAX_RECORD_OUTPUT_READ)
+          : opts.output;
+      if (opts.command && rawOutput !== undefined) {
+        const savedOutput = saveExecutionOutput(workspace.id, {
+          command: opts.command,
+          raw: rawOutput,
+          exitCode: opts.exitCode !== undefined ? parseInt(opts.exitCode, 10) : null,
+          taskId: opts.task,
+          iteration: parseInt(opts.iteration, 10),
+        });
+        outputId = savedOutput.id;
+        outputAvailable = savedOutput.allowed;
+      }
       appendExecutionRecord(workspace.id, {
         taskId: opts.task,
         iteration: parseInt(opts.iteration, 10),
@@ -919,9 +1075,13 @@ program
         tests: opts.tests ?? null,
         exitStatus: opts.exitStatus,
         timestamp: new Date().toISOString(),
-        notes: opts.notes,
+        notes: opts.notes?.slice(0, 400),
+        outputId,
+        outputAvailable,
       });
-      check("已记录执行摘要");
+      if (outputId !== undefined && !outputAvailable) check("已记录执行摘要（输出未对 ChatGPT 开放）");
+      else if (outputId !== undefined) check("已记录执行摘要与输出");
+      else check("已记录执行摘要");
     }
   );
 
